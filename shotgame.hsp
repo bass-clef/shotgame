@@ -1,0 +1,1808 @@
+	
+	/*
+	
+	:ホスト:
+	・クライアントのログインアウトを記録
+	・クライアントからの処理を処理して全クライアントに送信
+	1.クライアントからの着信を待つ
+		2.鯖で受信したプレイヤーの位置を変更
+		3.全クライアントにプレイヤーデータ送信
+	
+		2.鯖で受信した弾の位置を変更
+		4.全クライアントに弾データ送信
+	
+	:クライアント:
+	・処理をサーバーに送信
+	・サーバーからの処理を表示
+	1.操作を監視
+	2.鯖に操作を送信
+	3.鯖チェック
+		4.鯖からプレイヤーデータ受信
+		5.鯖から弾データ受信
+		6.描画
+		
+	:パケットルール:
+	・処理タイプチェックに4byte
+	・プレイヤーIDに4byte
+	
+	:仕様:
+	http://www45.atwiki.jp/utige/pages/21.html
+	・プレイヤーは丸
+	・弾は点
+	・全方位
+	・移動はWASD,ダッシュ:SPACE,リロード:R,M:マップON/OFF,1-3|ホイール:武器切り替え,T:チャット表示,ESC:メニュー/キャンセル
+	・HPは100
+	・チャット機能
+		コメント欄
+			・任意行表示
+			・送信者表示
+			・入力中は全ログ表示
+			・入力直後/受信直後 は対象一行のみ一定時間表示
+		送信内容
+			種類(コマンド,文字)	2byte
+			コメント			62byte
+	・移動
+		・プレイヤー情報の同期から 名前をなくす,更新してないプレイヤーの情報を抜く,多すぎて同期できてないｗ
+			sendPlayersInfo の廃止 PACKET_TYPE_GETPOS の実装
+	
+	・playerのkillの蔵への送信
+		チャット作成
+	
+	・ダッシュ
+	・鯖が死んだときの待機 or 停止
+	
+	・攻撃
+		:武器種類
+		HP計算は鯖で管理する
+		
+		1.フルオートハンドガン	g_pistol	弾数:12	距離r:100	威力:30		330m/s
+		2.マシンガン			g_macingun	弾数:50	距離r:200	威力:25		420m/s
+		3.スナイパーライフル	g_rifle		弾数:3	距離r:1000	威力:100	850m/s
+		
+		:送信内容
+			1.武器切り替え時に鯖に種類を送信
+			1.武器切り替え時に全蔵(送信元以外)に武器種類を送信
+		蔵
+			2.発砲時
+				自分の座標とポインタの角度 を鯖に送信
+			4.鯖からの角度と武器の種類を蔵の方で描画,送信元はほか蔵より少し早く反映される
+		鯖
+			3.蔵からの[角度]を全蔵()に送信
+			4.鯖がダメージ計算
+				5.鯖がhit(HP,shotBlankId)情報を蔵に送信
+				hit情報
+					1.当たる
+					2.鯖が蔵にHP,蔵に他の蔵のHP情報は保存してないから当たった蔵にHP情報で
+					3.蔵がPACKET_TYPE_GETHITINFO取得
+			
+		弾道自体は蔵,鯖で計算するけど,当たり判定だけは鯖で管理
+			蔵の移動の際に計算
+		蔵の弾は表示のみで計算はしないからもしかしたらラグアーマーができるかもしれない
+	・手榴弾
+		爆風がある
+		進む速度はsin
+		右クリック
+		蔵は描画距離計算だけ
+		鯖はダメ計算も
+	・武器切り替え同期
+	・map機能
+		黒は壁
+		鯖で描画できる
+			PACKET_TYPE_MAPCHANGE の送信
+		蔵のマップの同期
+			PACKET_TYPE_MAPDATA の送信	// 一度に送ると 4.8K くらいあるから分けようと思ったけどやめた,たまにtcpSendでエラーが起きる
+			
+	::
+	マップ実装終了後に蔵テスト
+	*/
+	
+	
+	#define TARGET_64BIT
+	
+	
+	#ifdef TARGET_64BIT
+	#packopt name "shotge"
+	#else
+	#packopt name "shotge32"
+	#endif
+	
+	#packopt hide 1
+	
+	// ログ出力
+	initLog
+	#undef logmes
+	#define global logmes(%1)	logmes__ ""+ %1
+	
+	// WinAPI
+	#uselib "user32.dll"
+	#func	setFocus			"SetFocus"			int
+	#cfunc	getForegroundWindow	"GetForegroundWindow"
+	#uselib "imm32.dll"
+	#func	immSetOpenStatus	"ImmSetOpenStatus"	int, int
+	#cfunc	immGetContext		"ImmGetContext"		int
+	#cfunc	immGetOpenStatus	"ImmGetOpenStatus"	int
+	#uselib "hspinet.dll"
+	#func	urlencode			urlencode			$202
+	#func	urldecode			urldecode			$202
+	
+	
+	#ifdef TARGET_64BIT
+	#uselib "subclassing.dll"
+	#func	registryWindow		"registryWindow"		int, int, int, int
+	#func	unregistryWindow	onexit	"unregistryWindow"
+	#endif
+	
+	
+	
+	// definitions
+	#define		APPNAME				"shotgame"
+	#define		ERROR_FILE			"error"
+	#define		USER_DATA_FILE		"ud.dat"
+	#define		MAP_DATA_FILE		"md.dat"
+	#define		BLACK_WHITE_FILE	"bwlist.dat"
+	#define		COMMAND_LEVEL_FILE	"cmdlevel.dat"
+	#define		SERVER_INIT_FILE	"server_init.txt"
+	#define		DEFAULT_PORT		30000
+	#define		UDP_PORT			30000
+	#define		PLAYER_NAME_SIZE	32
+	#define		CHAT_MAX			62	// 64[2:Type, CHAT_MAX=64-2]
+	#define		VK_SLASH			VK_OEM_2
+	#define		TEAM_NEUTRAL		0
+	#define		DEFAULT_COMMAND_LEVEL	0
+	#define		GLOBAL_DEFINE
+	#define	global		ASTAR_WALL			INT_MAX
+	
+	#enum	ID_UNKNOWN	= -4
+	#enum	ID_SELF
+	#enum	ID_TEXT
+	#enum	ID_SERVER
+	
+	#enum	BM_NULL		= -1
+	#enum	BM_SERVER
+	#enum	BM_CLIENT
+	
+	// ウィンドウID
+	#enum	backWndId	= 0
+	#enum	mainWndId
+	#enum	workWndId
+	#enum	blackWndId
+	#enum	whiteWndId
+	#enum	redWndId
+	#enum	greenWndId
+	#enum	blueWndId
+	#enum	mapWndId
+	#enum	explosionWndId
+	#enum	dlgWndId
+	
+	// キャンバスID
+	#enum	CVS_NOTSELECT = -1
+	#enum	CVS_MAIN
+	#enum	CVS_PAUSE
+	#enum	CVS_OPTION
+	
+	// ポーズ状態
+	#enum	WINDOW_ACTIVE	= 0
+	#enum	WINDOW_PAUSE
+	#enum	WINDOW_BACKGROUND
+	#enum	WINDOW_OPTION
+	
+	// キーマップ
+	#enum	K_LEFT		= 0
+	#enum	K_UP
+	#enum	K_RIGHT
+	#enum	K_DOWN
+	
+	#enum	K_SHOT
+	#enum	K_SUBSHOT
+	#enum	K_GUN_1
+	#enum	K_GUN_2
+	#enum	K_GUN_3
+	
+	#enum	K_RELOAD
+	#enum	K_RUN
+	#enum	K_MAP
+	
+	#enum	K_ALLOW_UP
+	#enum	K_ALLOW_DOWN
+	
+	#enum	K_CHAT
+	#enum	K_CMD
+	#enum	K_RETURN
+	#enum	K_DEBUGINFO
+	#enum	K_LOG
+	#enum	K_TAB
+	
+	#enum	K_ESCAPE
+	#enum	K_MAP_MAX
+	
+	// コマンド
+	#enum	CMD_ERROR	= 0
+	#enum	CMD_CHAT
+	#enum	CMD_ANY
+	/**/
+	#enum	CMD_MAPEDITTOGGLE
+	#enum	CMD_CHANGECOLOR
+	#enum	CMD_TEAM
+	#enum	CMD_HELP
+	#enum	CMD_KILL
+	#enum	CMD_WORLDSPAWN
+	#enum	CMD_TIP
+	#enum	CMD_FILL
+	#enum	CMD_TP
+	
+	#enum	CMD_BAN
+	/**/
+	
+	// SE
+	#enum	SE_HANDGUN		= 0
+	#enum	SE_MACHINEGUN
+	#enum	SE_RIFLE
+	#enum	SE_H_E
+	#enum	SE_EXPLOSION
+	
+	// 弾種類
+	#enum	GUN_TYPE_HANDGUN	= 0
+	#enum	GUN_TYPE_MACHINEGUN
+	#enum	GUN_TYPE_RIFLE
+	#enum	GUN_TYPE_H_E
+	#enum	GUN_TYPE_EXPLOSION
+	
+	// 色種類
+	#enum	COLOR_TYPE_PLAYER	= 0
+	#enum	COLOR_TYPE_TEAM
+	
+	// チーム変更の種類
+	#enum	TEAM_TYPE_ADD		= 0
+	#enum	TEAM_TYPE_REMOVE
+	#enum	TEAM_TYPE_JOIN
+	#enum	TEAM_TYPE_LEAVE
+	
+	// 送信したパケットの種類
+	#enum	PACKET_TYPE_BEGIN		= 0
+	#enum	PACKET_TYPE_GETPOS
+	#enum	PACKET_TYPE_SETPOS
+	#enum	PACKET_TYPE_GETPLAYERSINFO
+	#enum	PACKET_TYPE_GETPLAYERINFO
+	#enum	PACKET_TYPE_RECVCHAT	= 5
+	#enum	PACKET_TYPE_GETGUNCHANGE
+	#enum	PACKET_TYPE_GETGUNANGLE
+	#enum	PACKET_TYPE_GETHITINFO
+	#enum	PACKET_TYPE_PLAYERKILL
+	#enum	PACKET_TYPE_MAPCHANGE	= 10
+	#enum	PACKET_TYPE_MAPDATA
+	#enum	PACKET_TYPE_CHANGECOLOR
+	#enum	PACKET_TYPE_TEAM
+	#enum	PACKET_TYPE_SUBWEAPON
+	#enum	PACKET_TYPE_LOGIN		= 15
+	#enum	PACKET_TYPE_LOGOUT
+	#enum	PACKET_TYPE_PLAYERNAME
+	#enum	PACKET_TYPE_UDPSOCKET
+	// = 18
+	#enum	PACKET_TYPE_END
+	
+	// macros
+	#undef print
+	#define print(%1, %2=ginfo_winx, %3=ginfo_winy, %4=4)		print__ %1, %2, %3, %4
+	#define socketErrorDialog	oncmd 0:	dialog "初期化に失敗しました。\nWinSockが使えない環境の可能性があります。", 0, APPNAME+" - socket error "+st :oncmd 1
+	#define packetErrorDialog	oncmd 0:	dialog "予期していないパケットを受信しました。再起動します。", 0, APPNAME + " - packet error "+packetType :oncmd 1 :reConnect
+	#define setRespawnPos(%1, %2, %3, %4)	respawnPos(%1) = %2 :respawnMapPos(%1) = %3 :respawnTeamList(%1) = %4
+	#define showFPS		mes "fps:"+ fps +" wt:"+ waittime@__FPS__ +" cut:"+ oldcut@__FPS__
+	#define	rollbackChatLog(%1=-1)	rollbackChatLog__ %1
+	
+	// includes
+	#include "pcbnet2.as"
+	#include "hspda.as"
+	#include "editmes.as"
+	
+	
+	#include "../bit.as"
+	#include "../BlankIdentifier.as"
+	#include "../fileio.as"
+	#include "../fps.as"
+	#include "../gui.as"
+	#include "../huffman.as"
+	#include "../keys.as"
+	#include "../list.as"
+	#include "../mathex.as"
+	#include "../sound.as"
+	#include "../variableToFile.as"
+	
+	// the above is required
+	#include "../astar.as"
+	
+	#include "chat.as"
+	#include "map.as"
+	#include "menu.as"
+	#include "player.as"
+	#include "shot.as"
+	#include "socket.as"
+	
+	
+	#ifdef _DEBUG
+	gsel 0, -1
+	#endif
+	
+	modalDialog dlgWndId, 250, 20
+	
+	// 変数初期化
+	logmes "initVeriables..."
+	title APPNAME+" - 変数の初期化中..."
+	initVariables
+	
+	// モジュール初期化
+	logmes "initModules..."
+	title APPNAME+" - モジュールの初期化中..."
+	initModules
+	
+	// リソース初期化
+	logmes "initResources..."
+	title APPNAME+" - リソースの初期化中..."
+	initResources
+	
+	// 起動設定
+	logmes "initOption..."
+	bootOption
+	
+	// 蔵初期化
+	initClient
+	
+	// Scoket初期化
+	logmes "initSocket..."
+	initSocket
+	
+	logmes "makeUDPSocket..."
+	initUDPSocket
+	
+	// ウィンドウ初期化
+	logmes "initWindow..."
+	initWindow
+	
+	// 鯖初期化
+	initServer
+	
+	// 共通main
+	logmes "ready."
+	
+	
+*main
+	fps = calcFPS()
+	if -1 == fps :goto *main
+	
+	switch bootmode
+	case BM_SERVER
+		serverMain
+		serverDraw
+		swbreak
+		
+	case BM_CLIENT
+		clientMain
+		clientDraw
+		swbreak
+	swend
+	
+	goto *main
+	
+	// サブクラス化
+*char
+	chatSpecialKeys wparam
+	return stat
+	
+*key
+	#ifndef TARGET_64BIT
+	gosub *char
+	#endif
+	
+	return
+	
+	// ウィンドウリサイズ
+*resize
+	
+	dim rc, 4
+	dupptr rc, lparam, 16, 4
+	
+	windowWidth = (rc.2-rc.0)-16
+	windowHeight = (rc.3-rc.1)-39
+	
+	resizedWindow
+	
+	return
+	
+	// 終了時
+*destroy
+	
+	exitResources
+	tcpClose mainSocket
+	udpClose udpServerSocket
+	
+	return
+
+	// エラー時
+*error
+	exitResources makelong(wparam, lparam)
+	end
+	
+
+	
+#deffunc initServer
+
+	if BM_CLIENT == bootmode :return
+	
+	logmes "initServer..."
+	// マップ読み込み
+	exist MAP_DATA_FILE
+	if -1 != strsize {
+		bload MAP_DATA_FILE, map, mapWidth*mapHeight*4
+		allMapTipRedraw
+	}
+	
+	loadBlackWhiteList
+	loadCommandLevel
+	
+	exist SERVER_INIT_FILE
+	if -1 != strsize {
+		size = strsize
+		sdim serverInitFileBuffer, size+1
+		bload SERVER_INIT_FILE, serverInitFileBuffer, size
+		notesel@hsp serverInitFileBuffer
+		logmes "server_init.txt("+ notemax +")"
+		repeat notemax
+			notesel@hsp serverInitFileBuffer
+			noteget@hsp serverInitCommand, cnt
+			if 0 == peek(serverInitCommand, 0) :continue
+			
+			addChat serverInitCommand, ID_SERVER
+		loop
+		
+		sdim chatBuffer
+	}
+	
+	return
+	
+#deffunc initClient
+	
+	if BM_SERVER == bootmode :return
+	logmes "initClient..."
+	
+	// サウンド
+	mciopen "data\\handgun.mp3",	SE_HANDGUN, 10
+	mciopen "data\\machinegun.mp3",	SE_MACHINEGUN, 15
+	mciopen "data\\rifle.mp3",		SE_RIFLE, 10
+	mciopen "data\\h_e.mp3",		SE_H_E, 10
+	mciopen "data\\explosion.mp3",	SE_EXPLOSION, 15
+	
+	return
+
+	// 非アクティブ時計算
+#deffunc backgroundCalc
+
+	// チャットがアクティブになってると反応しない
+	objsel -1
+	if stat == inputId :chatActhivedFlag = true :else :chatActhivedFlag = false
+	wheel = mousew
+	
+	// 通信関係は非アクティブでも計算する
+	checkSocketPacket
+	checkUDPSocketPacket
+	
+	// 銃弾
+	shotCalc
+	
+	// チャット
+	chatCalc wheel
+	
+	// メニュー監視
+	menuCalc
+	
+	// GUI計算
+	calcGUI mousex, mousey, keyDowned(keys.K_SHOT), keyDowning(keys.K_SHOT), wheel < 0, 0 < wheel
+	
+	// デバッグ
+	if keyDowned(keys.K_DEBUGINFO) {
+		if keyDowning(keys.K_LOG) {
+			// ログ出力の切り替え
+			outputLog = outputLog^1
+		} else {
+			// デバッグ情報の表示切り替え
+			debugInfoVisible = debugInfoVisible^1
+		}
+	}
+	
+	// 描画始点
+	switch bootmode
+	case BM_CLIENT
+		if -1 != myPlayerId {
+			myMapXPos = wordtoint(loword(playerMapPosList.myPlayerId))
+			myMapYPos = wordtoint(hiword(playerMapPosList.myPlayerId))
+		}
+		swbreak
+	case BM_SERVER
+		if ID_SERVER == targetPlayerId {
+			myMapXPos = -xMapEditBase*mapTipWidth
+			myMapYPos = -yMapEditBase*mapTipHeight
+		} else {
+			myMapXPos = wordtoint(loword(playerMapPosList.targetPlayerId))
+			myMapYPos = wordtoint(hiword(playerMapPosList.targetPlayerId))
+		}
+		swbreak
+	swend
+	
+	// プレイヤー計算
+	if BM_CLIENT == bootmode :if -1 == myPlayerId :return
+	repeat playerCount
+		if isBlankId(cnt, playerCount, player) :continue
+		if spawnWaitTime.cnt {
+			if BM_CLIENT == bootmode :if cnt == myPlayerId && ID_SERVER != myKillerId {
+				playerPosList.myPlayerId = playerPosList.myKillerId
+				playerMapPosList.myPlayerId = playerMapPosList.myKillerId
+			}
+			spawnWaitTime.cnt--
+			if 0 == spawnWaitTime.cnt {
+				// 復活
+				respawnPlayer cnt
+			}
+		}
+	loop
+	
+	return
+
+#deffunc debugInfoDraw
+	
+	// プレイヤーの位置
+	playersDraw
+	
+	// 弾の位置
+	shotsDraw
+	
+	colorwhite
+	pos xMargin, yMargin
+	showFPS
+	
+	// OP権限
+	mes "オペレーター権限("+ usedIdCount(opCount, op) +"):"
+	for i, 0, opCount, 1
+		if isBlankId(i, opCount, op) :_continue
+		xAdd = fSize * (2+ strlen(str(commandLevelId.i)) +1)
+		xx = ginfo_cx + xAdd
+		yy = ginfo_cy
+		mes "["+ commandLevelId.i +"]"
+		repeat commandCount
+			if isBlankId(cnt, commandCount, command) :continue
+			x = xx+ fSize*cnt
+			if sbGet(commandLevel.i, cnt) {
+				boxf x, yy, x+fSize, yy+fSize
+			} else {
+				boxf x, yy, x+fSize, yy+fSize, 0
+			}
+		loop
+		pos xx-xAdd, yy+fSize*2
+	next
+	mes ""
+	
+	//
+	mes "リスポーン地点("+ usedIdCount(respawnCount, respawn) +")"
+	repeat respawnCount
+		if isBlankId(cnt, respawnCount, respawn) :continue
+		x = wordtoint(loword(respawnPos.cnt))
+		y = wordtoint(hiword(respawnPos.cnt))
+		mx = wordtoint(loword(respawnMapPos.cnt))
+		my = wordtoint(hiword(respawnMapPos.cnt))
+		mes "pos:"+ x +"x"+ y +" mappos:"+ mx +"x"+ my +" team:"+ teamNameList.respawnTeamList(cnt)
+	loop
+	mes ""
+	
+	// プレイヤー
+	cy = ginfo_cy
+	mes "接続しているプレイヤー("+ usedIdCount(playerCount, player) +"):"
+	repeat playerCount
+		if isBlankId(cnt, playerCount, player) :continue
+		x = wordtoint(loword(playerPosList.cnt))
+		y = wordtoint(hiword(playerPosList.cnt))
+		mx = wordtoint(loword(playerMapPosList.cnt))
+		my = wordtoint(hiword(playerMapPosList.cnt))
+		str_ = "["+ playerNameList.cnt +"] gun("+ playerGunTypeList.cnt +") ("+ x +"x"+ y +" : "+ mx +"x"+ my +") hp["+ playerHPList.cnt +"]"
+	
+		mes str_
+		if playerIsAIList.cnt {
+			xx = ginfo_cx
+			yy = ginfo_cy
+			for i, 0, 32, 1
+				boxf xx+ i*fSize, yy, xx+ i*fSize +fSize, yy+fSize, bGet(playerIsAIList.cnt, i)
+			next
+			if bGet(playerIsAIList.cnt, AI_MODE_ROUTE) {
+				count = lpeek(playerRouteList.cnt, 4)
+				p = lpeek(playerRouteList.cnt, count*4+8)
+				px = loword(p) * mapTipWidth + myMapXPos
+				py = hiword(p) * mapTipHeight + myMapYPos
+				boxf xBase+px, yBase+py, xBase+px+mapTipWidth, yBase+py+mapTipHeight, 0
+			}
+			pos xx, yy+fSize
+		}
+	loop
+	
+	// チーム
+	pos windowWidth/2, yMargin :mes "チーム一覧 ("+ usedIdCount(teamCount, team) +"):"
+	repeat teamCount
+		if isBlankId(cnt, teamCount, team) :continue
+		mes "["+ teamNameList.cnt +"]"
+		x = ginfo_cx
+		for i, 0, playerCount, 1
+			if isBlankId(i, playerCount, player) :_continue
+			if cnt != playerTeamList.i :_continue
+			pos x+20 :mes playerNameList.i
+		next
+		pos x
+	loop
+	mes ""
+	
+	// 弾
+	mes "弾("+ usedIdCount(shotCount, shot) +"):"
+	repeat shotCount
+		if isBlankId(cnt, shotCount, shot) :continue
+		mes "angle["+ shotAngleList.cnt +"] t["+ shotTypeList.cnt +"] p["+ getPlayerName(shotPlayerMasterList(cnt)) +"]"
+	loop
+
+	return
+	
+	// Server Main
+#deffunc serverMain
+	
+	if hMainWnd == getForegroundWindow() {
+		calcKeys
+	}
+	
+	// AI計算
+	aiCalc
+	
+	// プレイヤー位置同期
+	if posSendCount {
+		posSendCount--
+	} else {
+		posSendCount = 2
+		repeat playerCount
+			if isBlankId(cnt, playerCount, player) :continue
+			if false == playerReadyList.cnt :continue
+			putPacketRule PACKET_TYPE_GETPOS, cnt
+			putPacketInt playerPosList.cnt
+			putPacketInt playerMapPosList.cnt
+		loop
+		repeat playerCount
+			if isBlankId(cnt, playerCount, player) :continue
+			if false == playerReadyList.cnt :continue
+			sendUDPPacket udpSocketList.cnt, true
+		loop
+		DeletePacketData
+	}
+		
+	// 非アクティブ時計算
+	backgroundCalc
+	
+	// マップ編集
+	editMap
+	
+	return
+	
+	// Server 描画
+#deffunc serverDraw
+	
+	redraw 0
+	color :boxf :colorwhite
+	
+	if mapeditmode | debugInfoVisible {
+		color :boxf
+		gmode 2
+		pos xBase, yBase :gcopy backWndId, -myMapXPos, -myMapYPos, viewMainWidth, viewMainHeight
+	
+		if mapeditmode {
+			colorwhite
+			pos xBase, yBase-fSize*2 :mes xMapEditBase
+			pos xBase-fSize*2*4, yBase :mes yMapEditBase
+			mx = mousex-xBase/mapTipWidth*mapTipWidth
+			my = mousey-yBase/mapTipHeight*mapTipHeight
+			if 0 <= mx && 0 <= my && mx < mainWidth && my < mainHeight {
+				mx = (mousex-xBase)/mapTipWidth*mapTipWidth + xBase
+				my = (mousey-yBase)/mapTipHeight*mapTipHeight + yBase
+				boxf mx, my, mx+mapTipWidth, my+mapTipHeight, 0
+			}
+		}
+	}
+	
+	if debugInfoVisible :debugInfoDraw
+	
+	// チャット
+	chatDraw
+	
+	// ボタン描画
+	drawGUI
+	
+	redraw 1
+	
+	
+	return
+	
+	
+	// Client Main
+#deffunc clientMain
+	
+	// キー監視
+	if hMainWnd == getForegroundWindow() {
+		calcKeys
+	}
+	
+	if WINDOW_ACTIVE == pauseFlag && false == chatActhivedFlag {
+		// アクティブ時計算
+		clientForegroundCalc
+	}
+	
+	// 非アクティブ時計算
+	backgroundCalc
+	
+	return
+	
+	// Client 計算
+
+	
+#deffunc clientForegroundCalc
+
+	if -1 == myPlayerId :return
+	if chatActhivedFlag :return
+	
+	// 移動
+	if 0 == spawnWaitTime.myPlayerId {
+		if keyDowning(keys.K_RUN)	:runFlag = true :else :runFlag = false
+	
+		initPosition myPlayerId
+		if keyDowned(keys.K_LEFT)	|| keyJustBeforeDown(keys.K_LEFT)	{
+			moveLeft
+		}
+		if keyDowned(keys.K_UP)		|| keyJustBeforeDown(keys.K_UP)		{
+			moveUp
+		}
+		if keyDowned(keys.K_RIGHT)	|| keyJustBeforeDown(keys.K_RIGHT)	{
+			moveRight
+		}
+		if keyDowned(keys.K_DOWN)	|| keyJustBeforeDown(keys.K_DOWN)	{
+			moveDown
+		}
+		moveApply myPlayerId
+	}
+	
+	// リロード
+	if keyDowned(keys.K_RELOAD)	|| keyJustBeforeDown(keys.K_RELOAD)	{
+		if 0 == gunWaitTime.playerGunTypeList(myPlayerId) :if gunRestCount.playerGunTypeList(myPlayerId) < gunDefaultRestCount.playerGunTypeList(myPlayerId) {
+			gunWaitTime.playerGunTypeList(myPlayerId) = reloadDefaultTime.playerGunTypeList(myPlayerId)
+			
+			gunWaitTimeMax.playerGunTypeList(myPlayerId) = gunWaitTime.playerGunTypeList(myPlayerId)
+			gunRestCount.playerGunTypeList(myPlayerId) = 0
+		}
+	}
+	
+	// 武器切り替え
+	socketId = mainSocket
+	oldGunType = playerGunTypeList.myPlayerId
+	if keyDowned(keys.K_GUN_1)	{
+		playerGunTypeList.myPlayerId = GUN_TYPE_HANDGUN
+	}
+	if keyDowned(keys.K_GUN_2)	{
+		playerGunTypeList.myPlayerId = GUN_TYPE_MACHINEGUN
+	}
+	if keyDowned(keys.K_GUN_3)	{
+		playerGunTypeList.myPlayerId = GUN_TYPE_RIFLE
+	}
+	if oldGunType != playerGunTypeList.myPlayerId {
+		sendGunType myPlayerId
+	
+		// 弾バーの横幅変更
+		shotBarWidth = windowWidth/2 / gunDefaultRestCount.playerGunTypeList(myPlayerId)
+	}
+
+	
+	// 発砲 - メイン
+	if gunWaitTime.playerGunTypeList(myPlayerId) {
+		gunWaitTime.playerGunTypeList(myPlayerId)--
+		if 0 == gunWaitTime.playerGunTypeList(myPlayerId) && 0 == gunRestCount.playerGunTypeList(myPlayerId) {
+			gunRestCount.playerGunTypeList(myPlayerId) = gunDefaultRestCount.playerGunTypeList(myPlayerId)
+		}
+	} else {
+		if 0 < playerHPList.myPlayerId :if gunRestCount.playerGunTypeList(myPlayerId) :if gunRestCount.playerGunTypeList(myPlayerId) :if keyDowned(keys.K_SHOT)	|| keyJustBeforeDown(keys.K_SHOT)	{
+			gunFireFlag = true
+			socketId = mainSocket
+			x = wordtoint(loword(playerPosList.myPlayerId)) + xBase
+			y = wordtoint(hiword(playerPosList.myPlayerId)) + yBase
+			gunFire myPlayerId, x, y, mousex, mousey
+			playerGunTypeList(myPlayerId) = playerGunTypeList(myPlayerId)
+		}
+		if gunFireFlag {
+			gunFireFlag = false
+			gunWaitTime.playerGunTypeList(myPlayerId) = gunDefaultWaitTime.playerGunTypeList(myPlayerId)
+			gunRestCount.playerGunTypeList(myPlayerId)--
+			if 0 == gunRestCount.playerGunTypeList(myPlayerId) {
+				// 残数0の自動リロード
+				gunWaitTime.playerGunTypeList(myPlayerId) += reloadDefaultTime.playerGunTypeList(myPlayerId)
+			}
+			gunWaitTimeMax.playerGunTypeList(myPlayerId) = gunWaitTime.playerGunTypeList(myPlayerId)
+		}
+	}
+	if not(keyDowning(keys.K_SHOT)) {
+		switch playerGunTypeList(myPlayerId)
+		case GUN_TYPE_MACHINEGUN
+			mcistop soundList.playerGunTypeList(myPlayerId)
+		swend
+	}
+	
+	// サブ
+	if gunWaitTime.playerSubWeaponTypeList(myPlayerId) {
+		gunWaitTime.playerSubWeaponTypeList(myPlayerId)--
+		if 0 == gunWaitTime.playerSubWeaponTypeList(myPlayerId) && 0 == gunRestCount.playerSubWeaponTypeList(myPlayerId) {
+			gunRestCount.playerSubWeaponTypeList(myPlayerId) = gunDefaultRestCount.playerSubWeaponTypeList(myPlayerId)
+		}
+	} else {
+		if 0 < playerHPList.myPlayerId :if gunRestCount.playerSubWeaponTypeList(myPlayerId) :if keyDowned(keys.K_SUBSHOT)	|| keyJustBeforeDown(keys.K_SUBSHOT)	{
+			gunFireFlag = true
+			socketId = mainSocket
+			subGunFire playerSubWeaponTypeList(myPlayerId)
+		}
+		if gunFireFlag {
+			gunFireFlag = false
+			gunWaitTime.playerSubWeaponTypeList(myPlayerId) = gunDefaultWaitTime.playerSubWeaponTypeList(myPlayerId)
+			gunRestCount.playerSubWeaponTypeList(myPlayerId)--
+			if 0 == gunRestCount.playerSubWeaponTypeList(myPlayerId) {
+				// 残数0の自動リロード
+				gunWaitTime.playerSubWeaponTypeList(myPlayerId) += reloadDefaultTime.playerSubWeaponTypeList(myPlayerId)
+			}
+			gunWaitTimeMax.playerSubWeaponTypeList(myPlayerId) = gunWaitTime.playerSubWeaponTypeList(myPlayerId)
+		}
+	}
+	if not(keyDowning(keys.K_SUBSHOT)) {
+		switch playerGunTypeList(myPlayerId)
+			mcistop soundList.playerSubWeaponTypeList(myPlayerId)
+		swend
+	}
+	
+	
+	
+	return
+
+	// Client 描画
+#deffunc clientDraw
+	
+	if -1 == myPlayerId || mapLoading {
+		redraw 0
+		color :boxf :colorwhite
+		if mapLoading {
+			str_ = "マップデータを受信中..."
+		} else :if -1 == myPlayerId {
+			str_ = "ログイン中..."
+		}
+		pos (windowWidth-strlen(str_)*fSize)/2, windowHeight/2 :mes str_
+		redraw 1
+		return
+	}
+	
+	redraw 0
+	
+	// マップ
+	color :boxf
+	gmode 2
+	pos xBase, yBase :gcopy backWndId, -myMapXPos, -myMapYPos, viewMainWidth, viewMainHeight
+	
+	if debugInfoVisible {
+		x = wordtoint(loword(playerPosList.myPlayerId))
+		y = wordtoint(hiword(playerPosList.myPlayerId))
+		colorwhite
+		pos 5, 5
+		mes "x:"+ x +" y:"+ y +" mx:"+ mx +" my:"+ my
+		mes "gun("+ playerGunTypeList.myPlayerId +")"
+		showFPS
+	}
+	
+	// チャット
+	chatDraw
+	
+	// プレイヤーの位置
+	playersDraw
+	
+	// 弾の位置
+	shotsDraw
+	
+	// 射程の表示
+	x = wordtoint(loword(playerPosList.myPlayerId)) + xBase
+	y = wordtoint(hiword(playerPosList.myPlayerId)) + yBase
+	r = dis2pt(x, y, mousex, mousey)
+	color 230, 230, 230
+	if r < shotMaxRange.playerGunTypeList(myPlayerId) {
+		// 射程圏内
+		playerAngle = atan(mousey-y, mousex-x)
+		angle = shotBlurAngle.playerGunTypeList(myPlayerId) / 2.0
+		x1 = x+cos(playerAngle-angle)*r
+		y1 = y+sin(playerAngle-angle)*r
+		x2 = x+cos(playerAngle+angle)*r
+		y2 = y+sin(playerAngle+angle)*r
+		blurR = dis2pt(x1, y1, x2, y2)
+		color 128, 128, 128
+		if blurR < playerRadius*2 {
+			// 必中
+			color 255
+		}
+	}
+	circle mousex-playerRadius*4, mousey-playerRadius*4, mousex+playerRadius*4, mousey+playerRadius*4, 0
+	
+	// HPバー
+	gmode 3,,, 175
+	pos hpBarX, hpBarY :gcopy blueWndId, 0, 0, hpBarWidth/playerDefaultHP * playerHPList.myPlayerId, hpBarHeight
+	if hpBarCount {
+		hpLen = oldMyHp-playerHPList.myPlayerId
+		r = double(hpBarWidth)/playerDefaultHP*hpLen
+		x = ( sin(-M_PI/2.0 / double(hpBarDefaultCount) * double(hpBarDefaultCount-hpBarCount)) +1.0) * r
+		pos hpBarX+playerHPList.myPlayerId, hpBarY :gcopy redWndId, 0, 0, x, hpBarHeight
+		hpBarCount--
+	}
+	colorwhite :boxf hpBarX, hpBarY, hpBarX+hpBarWidth, hpBarY+hpBarHeight, 0
+	pos hpBarX+xMargin, hpBarY :mes ""+ playerHPList.myPlayerId +"/"+ playerDefaultHP
+	
+	// 弾残数バー
+	gmode 3,,, 128
+	x = shotBarWidth+1
+	shotBarFullWidth = x*gunDefaultRestCount.playerGunTypeList(myPlayerId)
+	repeat gunRestCount.playerGunTypeList(myPlayerId)
+		pos shotBarX+cnt*x+1, shotBarY :gcopy greenWndId, 0, 0, shotBarWidth, shotBarHeight
+	loop
+	pos shotBarX+xMargin, shotBarY :mes ""+ gunRestCount.playerGunTypeList(myPlayerId) +"/"+ gunDefaultRestCount.playerGunTypeList(myPlayerId)
+	// 弾待機時間
+	if gunWaitTime.playerGunTypeList(myPlayerId) {
+		if gunRestCount.playerGunTypeList(myPlayerId) {
+			max = double(shotBarWidth)
+			x *= gunRestCount.playerGunTypeList(myPlayerId)
+		} else {
+			max = double(shotBarFullWidth)
+			x = 0
+		}
+		
+		xAdd = max / double(gunWaitTimeMax.playerGunTypeList(myPlayerId)) * double(gunWaitTime.playerGunTypeList(myPlayerId))
+		pos shotBarX+x, shotBarY :gcopy redWndId, 0, 0, xAdd, shotBarHeight
+	}
+	colorwhite :boxf shotBarX, shotBarY, shotBarX + shotBarFullWidth+1, shotBarY + shotBarHeight, 0
+	// サブ
+	color
+	repeat gunRestCount.playerSubWeaponTypeList(myPlayerId)
+		x = subShotBarX+(subShotBarWidth+xMargin*2)*cnt
+		color
+		circle x, subShotBarY, x+subShotWidth, subShotBarY+subShotHeight
+		color 0, 128, 0
+		circle x, subShotBarY, x+subShotWidth, subShotBarY+subShotHeight, 0
+	loop
+	
+	// 所属チーム
+	colorwhite
+	str_ = "所属チーム:"+teamNameList.playerTeamList(myPlayerId)
+	len = strlen(str_)
+	teamXPos = windowWidth-len*fSize-xMargin
+	pos teamXPos, teamYPos :gcopy blackWndId, 0, 0, len*fSize, fSize*2
+	pos teamXPos, teamYPos :mes str_
+	
+	gmode 0
+	
+	// 接続しているユーザー表示
+	if keyDowning(keys.K_TAB)	{
+		colorwhite
+		gmode 3,,, 128
+		pos userWindowXPos, userWindowYPos :gcopy blackWndId, 0, 0, userWindowWidth, userWindowHeight
+		gmode 0
+		
+		repeat playerCount
+			if isBlankId(cnt, playerCount, player) :continue
+			pos userWindowXPos+xMargin, userWindowYPos+cnt*fSize*2 :mes playerNameList.cnt
+		loop
+	}
+	
+	// ポーズ & 復活待機時
+	if spawnWaitTime.myPlayerId || pauseFlag {
+		gmode 3, 0, 0, 75
+		if pauseFlag {
+			pos 0, 0 :gcopy blackWndId, 0, 0, windowWidth, windowHeight
+			str_ = ""
+			if WINDOW_PAUSE == pauseFlag || WINDOW_BACKGROUND == pauseFlag :str_ = "ＰＡＵＳＥ"
+		}
+		if spawnWaitTime.myPlayerId {
+			pos 0, 0 :gcopy redWndId, 0, 0, windowWidth, windowHeight
+			str_ = "復活まで "+ (spawnWaitTime.myPlayerId/(respawnWaitTime/10)+1) +" カウント"
+		}
+		gmode 0
+		
+		colorwhite
+		pos (windowWidth-strlen(str_)*fSize)/2, windowHeight/2 :mes str_
+	}
+	
+	// ボタン描画
+	drawGUI
+	
+	redraw 1
+	
+	return
+	
+	// プレイヤーの描画
+#deffunc playersDraw
+	
+	repeat playerCount
+		if isBlankId(cnt, playerCount, player) :continue
+		if playerHPList.cnt <= 0 && cnt == myPlayerId :continue
+		
+		x = wordtoint(loword(playerPosList.cnt)) + xBase
+		y = wordtoint(hiword(playerPosList.cnt)) + yBase
+		mx = wordtoint(loword(playerMapPosList.cnt))
+		my = wordtoint(hiword(playerMapPosList.cnt))
+		if cnt != myPlayerId {
+			x += -mx + myMapXPos
+			y += -my + myMapYPos
+			if x < xBase || y < yBase || xBase+viewMainWidth < x || yBase+viewMainHeight < y :continue
+		}
+		
+		clr = playerColorList.cnt
+		color RR(clr), GG(clr), BB(clr)
+		circle x-playerRadius, y-playerRadius, x+playerRadius, y+playerRadius
+		
+		clr = teamColorList.playerTeamList(cnt)
+		color RR(clr), GG(clr), BB(clr)
+		circle x-playerRadius, y-playerRadius, x+playerRadius, y+playerRadius, 0
+	
+		if cnt == myPlayerId :continue
+		color
+		if playerHPList.cnt <= 0 :color 255
+		lstr = strlen(playerNameList.cnt)
+		pos x - lstr/2 * fSize, y + playerRadius :mes playerNameList.cnt
+	loop
+	
+	return
+	
+	// ウィンドウの初期化
+#deffunc initWindow
+	
+	if BM_SERVER == bootmode :fSize = 6
+	
+	initWindowResources
+	
+	screen mainWndId, mainWidth, mainHeight, 0, (ginfo(20)-windowWidth)/2, (ginfo(21)-windowHeight)/2, windowWidth, windowHeight
+	hMainWnd = hwnd
+	slong hMainWnd, GWL_EXSTYLE, 0
+	spos hMainWnd
+	if bootmode == BM_SERVER {
+		title ""+ APPNAME +" - server"
+	} else {
+		title APPNAME
+	}
+	
+	font msgothic, fSize*2
+	
+	objmode 2, 0
+	pos xMargin, mainHeight
+	input chatBuffer, windowWidth-xMargin*2, fSize*2+2, 0, 0 :inputId = stat :hInputWnd = objinfo(inputId, 2)
+	hImc = immGetContext(hInputWnd)
+	
+	gsel workWndId
+	font msgothic, fSize*2
+	gsel mainWndId
+	
+	setFocus hMainWnd
+	
+	// GUI
+	initGUI blackWndId, whiteWndId, workWndId, fSize, xMargin, yMargin
+	
+	// メニュー
+	initMenu
+	
+	selectCanvas CVS_MAIN
+	
+	resizedWindow
+	
+	oncmd gosub *destroy, WM_DESTROY
+	oncmd gosub *resize, WM_SIZING
+	
+	#ifdef TARGET_64BIT
+	// 64bit
+	registryWindow hInputWnd, WM_CHAR, hMainWnd, WM_APP+WM_CHAR
+	oncmd gosub *char, WM_APP+WM_CHAR
+	
+	#else
+	// 32bit
+	onkey gosub *key
+	onkey 0
+	#endif
+	
+	
+	#ifndef _DEBUG
+	onerror *error
+	#endif
+	
+	return
+	
+	// ウィンドウサイズ変更
+#deffunc resizedWindow
+	
+	xBase = (windowWidth - viewMainWidth)/2
+	yBase = (windowHeight - viewMainHeight)/2
+	
+	teamYPos = windowHeight-yMargin-fSize*2
+	
+	shotBarY = windowHeight-shotBarHeight-yMargin
+	if -1 != myPlayerId {
+		shotBarWidth = windowWidth/2 / gunDefaultRestCount.playerGunTypeList(myPlayerId)
+	}
+	
+	hpBarY = shotBarY-yMargin-hpBarHeight
+	subShotBarY = hpBarY
+	
+	chatPos			= makelong(xMargin, windowHeight-chatMargin-fSize*2)
+	chatWidth		= windowWidth/4*3
+	ssize windowWidth-xMargin*2, fSize*2+2, hInputWnd
+	if chatVisible {
+		smove xMargin, windowHeight-yMargin-fSize*2-2, hInputWnd
+		makeChatWindow true
+	}
+	
+	userWindowWidth		= windowWidth/3
+	userWindowHeight	= windowHeight/3*2
+	userWindowXPos		= (windowWidth-userWindowWidth)/2
+	
+	resizeMenu
+	
+	return
+	
+	// 変数の初期化
+#deffunc initVariables
+	
+	
+	#ifdef _DEBUG
+	chdir "D:\\Program Files\\HSP\\shotgame\\"
+	debugInfoVisible = true
+	#else
+	chdir dir_exe
+	#endif
+	
+	// TCP関係
+	sdim buf
+	bootmode = BM_NULL
+	port = DEFAULT_PORT
+	usingUDPPort = UDP_PORT
+	usingMultiCastIP = MULTICAST_IP
+	sdim hostip
+	sdim userDataFile
+	
+	// 基本情報
+	sdim str_
+	xMargin = 5
+	yMargin = 5
+	mapTipWidth = 16
+	mapTipHeight = 16
+	mainWidth = 80*mapTipWidth
+	mainHeight = 60*mapTipHeight
+	viewMainWidth = 25*mapTipWidth
+	viewMainHeight = 20*mapTipHeight
+	windowWidth = 640
+	windowHeight = 480
+	xBase = (windowWidth-viewMainWidth)/2
+	yBase = (windowHeight-viewMainHeight)/2
+	fSize = 7
+	configColor	= 0
+	
+	// ポーズ
+	pauseFlag = false
+	pauseWait = 0
+	optBtn = -1
+	exitBtn = -1
+	keyCodeChanging = -1
+	
+	// GUN_TYPE_, SE_, volume
+	masterVolume = 500
+	masterVolumeMax = 1000
+	#define regSound(%1, %2, %3)	soundList.%1 = %2 :soundVolumeList.%1 = %3
+	regSound GUN_TYPE_HANDGUN,		SE_HANDGUN, 300
+	regSound GUN_TYPE_MACHINEGUN,	SE_MACHINEGUN, 1000
+	regSound GUN_TYPE_RIFLE,		SE_RIFLE, 1000
+	regSound GUN_TYPE_H_E,			SE_H_E, 600
+	regSound GUN_TYPE_EXPLOSION,	SE_EXPLOSION, 1000
+	
+	// プレイヤー
+	runFlag = false
+	runSpeed = 2
+	moveSpeed = 2
+	myPlayerId = ID_SERVER
+	targetPlayerId = ID_SERVER
+	sdim playerName, PLAYER_NAME_SIZE+1
+	playerId = 0
+	playerRadius = 4
+	playerDefaultHP = 100
+	playerDefaultColor = 0
+	respawnWaitTime = 500
+	
+	// チーム
+	teamDefaultColor = 0xFFFFFF
+	teamYPos = windowHeight-yMargin-fSize*2
+	teamNeutralId = 0
+	
+	// 弾	HANDGUN,MACHINEGUN,RIFLE,H_E,explosion
+	shotRadius			= 2, 2, 2, 2, 32
+	gunWaitTime			= 0, 0, 0, 0, 0
+	gunWaitTimeMax		= 0, 0, 0, 0, 0
+	gunDefaultWaitTime	= 13, 0, 100, 20, 0			// 次の弾まで
+	gunRestCount		= 12, 50, 3, 6, 0			// 残数
+	gunDefaultRestCount	= 12, 50, 3, 6, 0			// 初期残数
+	shotSpeed			= 12, 16, 32, 1, 1			// 弾速
+	shotMaxRange		= 200, 160, 1000, 50, 15	// 弾の最大距離
+	reloadDefaultTime	= 30, 150, 100, 0, 0		// リロード速度
+	shotBlurAngle		= M_PI / 64.0, M_PI / 3.0, 0f, 0f, 0f	// 照準のぶれ
+	shotAttackList		= 30, 15, 100, 5, 4
+	
+	// 弾残数バー
+	shotBarWidth = windowWidth/2 / gunDefaultRestCount.GUN_TYPE_HANDGUN
+	shotBarHeight = 16
+	shotBarX = xMargin
+	shotBarY = windowHeight-shotBarHeight-yMargin
+	
+	// HPバー
+	hpBarCount = 0
+	hpBarDefaultCount = 100
+	hpBarWidth = 100
+	hpBarHeight = 16
+	hpBarX = xMargin
+	hpBarY = shotBarY-yMargin-hpBarHeight
+	
+	// サブ弾数
+	subShotBarX = hpBarX+hpBarWidth+xMargin
+	subShotBarY = hpBarY
+	subShotWidth = 7
+	subShotHeight = 16
+	
+	// チャット
+	chatIndex		= 0
+	chatTextColor	= 0xFFFFFF
+	chatDefaultVisibleTime = 600
+	chatVisibleTime	= chatDefaultVisibleTime
+	chatDefaultAlpha = 128
+	chatAlpha		= chatDefaultAlpha
+	chatAlphaSpeed	= 2
+	chatWidth		= windowWidth/4*3
+	chatHeight		= fSize*2+2
+	chatHeightLength = 10
+	chatDefaultPos	= makelong(5, windowHeight-60-fSize*2)
+	chatPos			= chatDefaultPos
+	chatScrollIndex	= 0
+	chatLogThrought	= true
+	chatMargin		= 10
+	chatLineMargin	= 2
+	sdim chatLog
+	sdim chatBuffer
+	sdim chatInputLog
+	
+	// ユーザーウィンドウ
+	userWindowWidth		= windowWidth/3
+	userWindowHeight	= windowHeight/3*2
+	userWindowXPos		= (windowWidth-userWindowWidth)/2
+	userWindowYPos		= yMargin*2
+	
+	// マップ
+	mapBaseInitWaitTime = 3
+	mapBaseWaitTime = 0
+	mapeditmode = false
+	mapSelId	= 0
+	mapWidth	= mainWidth/mapTipWidth
+	mapHeight	= mainHeight/mapTipHeight
+	xMapEditBase = 0
+	yMapEditBase = 0
+	mapSelId	= makelong(0, 24)
+	dim map, mapWidth, mapHeight
+	for i, 0, mapHeight
+		repeat mapWidth
+			map(cnt, i) = mapSelId
+			index += 4
+		loop
+	next
+	
+	return
+	
+	// モジュールの初期化
+#deffunc initModules
+
+	// ID管理用
+	// プレイヤー数
+	initBlankId player
+	dim udpPortList
+	dim udpSocketList
+	dim playerIPList
+	sdim playerIPNameList
+	sdim playerInfoList		// IP/ポート
+	
+	dim playerIsAIList		// AIかどうか
+	sdim playerRouteList
+	
+	dim clientSocketList	// ソケット情報
+	dim playerPosList		// 座標
+	dim playerMapPosList	// マップ位置
+	dim playerGunTypeList	// 武器種類
+	dim playerHPList		// 体力
+	dim playerTeamList		// チーム
+	dim playerColorList		// 色
+	dim playerSubWeaponTypeList	// サブ
+	dim spawnWaitTime
+	sdim playerNameList
+	playerCount = 0 :playerMax = 100
+	
+	// チーム数
+	initBlankId team
+	dim teamColorList
+	sdim teamNameList
+	teamCount = 0 :teamMax = 100
+	
+	// 弾数
+	initBlankId shot
+	dim shotPlayerMasterList	// 弾の元保持者
+	dim shotTypeList		// 弾種類
+	dim shotRangeList		// 進んだ距離
+	ddim shotXPosList,0		// 座標
+	ddim shotYPosList,0
+	ddim shotAngleList,0	// 角度
+	shotCount = 0 :shotMax = 100
+	
+	// リスポーン地点数
+	initBlankId respawn
+	dim respawnPos :dim respawnMapPos
+	dim respawnTeamList
+	respawnCount = 0 :respawnPosMax = 100
+	
+	// ホワイト/ブラック リスト
+	initBlankId blackList
+	initBlankId whiteList
+	blackListCount = 0 :blackListMax = 1000
+	whiteListCount = 0 :whiteListMax = 1000
+	blackListFlag = true :whiteListFlag = false
+	sdim blackListName :dim blackListIP
+	sdim whiteListName :dim whiteListIP
+	
+	// チャット
+	chatCount = 0 :chatMax = INT_MAX
+	initList chatMax, chat
+	dim chatIdList
+	
+	// コマンド
+	initBlankId command
+	commandCount = 0 :commandMax = 100
+	initBlankId commandLabel
+	commandLabelCount = 0 :commandLabelMax = 1000
+	initBlankId commandChild
+	commandChildCount = 0 :commandChildMax = 1000
+	initCommandEx
+	
+	// OP権限
+	initBlankId op
+	opCount = 0 :opMax = 1000
+	dim playerCommandLevel
+	sdim commandLevel
+	
+	// ファイルIO簡略化
+	initFileio
+	
+	// FPS安定化
+	ifps = 60
+	initFramesPerSecond ifps, 60
+	repeat
+		fps = calcFPS()
+		if -1 != fps :break
+	loop
+	
+	// キー管理用
+	#define regKey(%1, %2, %3)		keys(%1) = %2 :registoryKey keys(%1), 1, %3
+	initKeys
+	regKey K_LEFT,	'A', 1
+	regKey K_UP,	'W', 1
+	regKey K_RIGHT,	'D', 1
+	regKey K_DOWN,	'S', 1
+	
+	regKey K_SHOT,		VK_LBUTTON, 1
+	regKey K_SUBSHOT,	VK_RBUTTON, 1
+	
+	regKey K_GUN_1,	'1', 1
+	regKey K_GUN_2,	'2', 1
+	regKey K_GUN_3,	'3', 1
+	
+	regKey K_RELOAD,	'R',		1
+	regKey K_RUN,		VK_SPACE,	1
+	regKey K_MAP,		'M',		1
+	
+	regKey K_ALLOW_UP,		VK_UP,		1
+	regKey K_ALLOW_DOWN,	VK_DOWN,	1
+	
+	regKey K_CHAT,		'T',		1
+	regKey K_CMD,		VK_SLASH,	1
+	regKey K_RETURN,	VK_RETURN,	1
+	regKey K_DEBUGINFO, VK_F3,		1
+	regKey K_LOG,		'L',		1
+	regKey K_TAB,		VK_TAB,		1
+	regKey K_ESCAPE,	VK_ESCAPE,	1
+	
+	return
+	
+#defcfunc popUserData
+	userDataCount++
+	return uds(userDataCount-1)
+#deffunc pushUserData str _str
+	if userDataCount :userDataBuffer += "\n"
+	userDataBuffer += _str
+	userDataCount++
+	return
+	
+	// ユーザーデータ読み込み
+#deffunc loadUserData str _fileName
+	
+	exist USER_DATA_FILE
+	if -1 == strsize :return
+	
+	size = strsize
+	sdim userDataBuffer, size+1
+	sdim uds
+	bload _fileName, userDataBuffer, size
+	split userDataBuffer, "\n", uds
+	
+	userDataCount = 0
+	playerName		= popUserData()
+	hostip			= popUserData()
+	port			= int(popUserData())
+	usingUDPPort	= int(popUserData())
+	windowSize		= int(popUserData())
+	masterVolume	= int(popUserData())
+	chatDefaultAlpha= int(popUserData())
+	configColor		= int(popUserData())
+	repeat K_MAP_MAX
+		keys.cnt	= int(popUserData())
+		regKey cnt,	keys.cnt, 1
+	loop
+		
+	windowWidth		= wordtoint(loword(windowSize))
+	windowHeight	= wordtoint(hiword(windowSize))
+	
+	return
+	
+	// ユーザーデータ書き込み
+#deffunc saveUserData str _fileName, int _force
+	
+	if BM_NULL == bootmode && false == _force :return
+	
+	sdim userDataBuffer
+	userDataCount = 0
+	
+	pushUserData playerName
+	pushUserData hostip
+	pushUserData str(port)
+	pushUserData str(usingUDPPort)
+	pushUserData str(makelong(windowWidth, windowHeight))
+	pushUserData str(masterVolume)
+	pushUserData str(chatDefaultAlpha)
+	pushUserData str(configColor)
+	repeat K_MAP_MAX
+		pushUserData str(keys.cnt)
+	loop
+	
+	bsave _fileName, userDataBuffer, strlen(userDataBuffer)
+	
+	return
+	
+	// ブラックリスト/ホワイトリストの読み込み
+#deffunc loadBlackWhiteList
+	
+	exist BLACK_WHITE_FILE
+	if -1 == strsize :return
+	
+	size = strsize
+	sdim userDataBuffer, size+1
+	sdim uds
+	sdim wbList
+	bload BLACK_WHITE_FILE, userDataBuffer, size
+	split userDataBuffer, "+", wbList
+	
+	if strlen(wbList.0) {
+		split wbList.0, "\n", uds
+		userDataCount = 0
+		repeat length(uds)
+			sdim userData
+			userDatas = popUserData()
+			split userDatas, "/", userData
+			urldecode blackListName.blackListCount, userData.0
+			blackListIP.blackListCount = int(userData.1)
+			blackListCount++
+		loop
+	}
+	
+	if strlen(wbList.1) {
+		split wbList.1, "\n", uds
+		userDataCount = 0
+		repeat length(uds)
+			sdim userData
+			userDatas = popUserData()
+			split userDatas, "/", userData
+			urldecode whiteListName.whiteListCount, userData.0
+			
+			whiteListIP.whiteListCount = int(userData.1)
+			whiteListCount++
+		loop
+	}
+	
+	return
+	
+	// ブラックリスト/ホワイトリストの書き込み
+#deffunc saveBlackWhiteList
+	
+	sdim userDataBuffer
+	userDataCount = 0
+	
+	repeat blackListCount
+		if isBlankId(cnt, blackListCount, blackList) :continue
+		userData = blackListName.cnt
+		urlencode userData, userData
+		pushUserData ""+ userData +"/"+ blackListIP.cnt
+	loop
+	userDataBuffer += "+"
+	repeat whiteListCount
+		if isBlankId(cnt, whiteListCount, whiteList) :continue
+		userData = whiteListName.cnt
+		urlencode userData, userData
+		pushUserData ""+ userData +"/"+ whiteListIP.cnt
+	loop
+	
+	bsave BLACK_WHITE_FILE, userDataBuffer, strlen(userDataBuffer)
+	
+	return
+	
+	// コマンド権限レベルの読み込み
+#deffunc loadCommandLevel
+	
+	loadFile COMMAND_LEVEL_FILE
+	if -1 == stat :return
+	
+	while fileIndexInSize()
+		levelId = popFileData()
+		setCommandLevelPlayer levelId, popFileData()
+		cmdTmpCount = popFileData()
+		repeat cmdTmpCount
+			setOPLevel levelId, popFileData("str")
+		loop
+	wend
+	
+	return
+	
+	// コマンド権限レベルの保存
+#deffunc saveCommandLevel
+
+	if not(opCount) :return
+	
+	saveFileName COMMAND_LEVEL_FILE
+	
+	// 将来との互換性を保つためにコマンド名を入れとく
+	for i, 0, opCount, 1
+		if isBlankId(i, opCount, op) :_continue
+		pushFileData commandLevelId.i
+		pushFileData commandPlayer.i
+		count = 0
+		repeat commandCount
+			if isBlankId(cnt, commandCount, command) :continue
+			if false == sbGet(commandLevel.i, cnt) :continue
+			count++
+		loop
+		pushFileData count
+		repeat commandCount
+			if isBlankId(cnt, commandCount, command) :continue
+			if false == sbGet(commandLevel.i, cnt) :continue
+			pushFileData cmdList.cnt
+			count--
+			if 0 == count :break
+		loop
+	next
+	
+	saveToFile
+	
+	return
+	
+#deffunc initWindowResources
+	
+	buffer explosionWndId, 1, 1
+	picload "data\\explosion.png"
+	explosionSize = makelong(64, 64)
+	
+	buffer mapWndId, mainWidth, mainHeight
+	picload "data\\maptips.png"
+	
+	buffer blueWndId, mainWidth, mainHeight
+	color 0, 175, 255 :boxf
+	
+	buffer greenWndId, mainWidth, mainHeight
+	color 0, 255 :boxf
+	
+	buffer redWndId, mainWidth, mainHeight
+	color 255 :boxf
+	
+	buffer whiteWndId, mainWidth, mainHeight
+	colorwhite :boxf
+	
+	buffer blackWndId, mainWidth, mainHeight
+	color RR(configColor), GG(configColor), BB(configColor) :boxf
+	
+	buffer workWndId, mainWidth, mainHeight
+	color :boxf
+	chatLogThrought = false
+	font msgothic, fSize*2
+	
+	buffer backWndId, mainWidth, mainHeight
+	color :boxf
+	gmode 4,,, 255 :color 0, 117, 117
+	for i, 0, mapHeight
+		repeat mapWidth
+			mapTipDraw cnt, i, map(cnt, i)
+		loop
+	next
+	vpinit mainWidth, mainHeight
+	
+	return
+	
+	// リソースの初期化
+#deffunc initResources
+
+	initWindowResources
+	
+	ownip hostip
+	loadUserData USER_DATA_FILE
+	
+	exist ERROR_FILE
+	if -1 != strsize {
+		// 復帰
+		
+	}
+	
+	return
+
+	// リソースの終了処理
+#deffunc exitResources int _errorFlag
+	
+	// データ保存
+	switch bootmode
+	case BM_SERVER
+		// ユーザー情報
+		repeat playerCount
+			if isBlankId(cnt, playerCount, player) :continue
+			savePlayerInfo cnt
+		loop
+		// ブラック/ホワイトリスト
+		saveBlackWhiteList
+		
+		// コマンド権限
+		saveCommandLevel
+	
+		// チームの保存
+		
+		// マップデータ書き込み
+		bsave MAP_DATA_FILE, map, mapWidth*mapHeight*4
+		swbreak
+	swend
+	
+	// IPとか
+	saveUserData "server\\"+userDataFile
+	
+	// ログ
+	logOutputCount = 32
+	logmes "exitResources"
+	
+	if 100 < logFileNumber {
+		dialog "過去ログが100件を超えました。\n\n削除しますか？", 2, APPNAME
+		if 6 == stat {
+			repeat logFileNumber-1
+				delete "logs\\last"+ cnt +".log"
+			loop
+		}
+	}
+	
+	if _errorFlag {
+		// エラー保存
+		errorBuffer  = "error Number : "+loword(_errorFlag)+"\n"
+		errorBuffer += "error Line   : "+hiword(_errorFlag)
+	}
+	
+	return
+
+	
+#deffunc initLog
+
+	if -1 == instr(dir_cmdline, 0, "-log") :return
+	
+	outputLog = true
+	
+	repeat
+		logFIleName = "logs\\last"+ cnt +".log"
+		exist logFIleName
+		if -1 == strsize {
+			v = 0
+			bsave logFileName, v, 0
+			logFileNumber = cnt
+			break
+		}
+	loop
+	
+	sdim logBuffer
+	logOutputCount = 0
+	
+	return
+#deffunc logmes__ str _str
+	
+	if false == outputLog :return
+	
+	timeStringLen = 30
+	
+	timeString = strf("[%04d/%2d/%2d %2d:%2d %2d] ", gettime(0), gettime(1), gettime(3), gettime(4), gettime(5), gettime(6))
+	logBuffer += "\n" + timeString + _str
+	logOutputCount++
+	#ifdef _DEBUG
+		logmes@hsp _str
+	#endif
+	
+	if logOutputCount < 16 :return
+	
+	exist logFileName
+	bsave logFileName, logBuffer, strlen(logBuffer), strsize
+	
+	sdim logBuffer
+	logOutputCount = 0
+	
+	return
+
+	#module
+	#deffunc modalDialog int _id, int _width, int _height
+		screen _id, _width, _height, 8, (ginfo(20)-_width)/2, (ginfo(21)-_height)/2
+		hSubWnd = hwnd
+//		style = glong(hSubWnd, -16)
+//		slong hSubWnd, -16, style & 0x00070000 ^ style
+		spos hSubWnd,,,,,, 0x37
+		gsel _id, 2
+	return
+	
+	#deffunc vpinit int xmax_, int ymax_
+		mref vram_, 66
+		width_ = xmax_
+		height_ = ymax_
+	return
+	
+	//vram抜き取り
+	#defcfunc vpgetex int px_, int py_
+		index_ = (height_ - 1 - py_) * ((width_ * 3 + 3) & 0xFFFFFFFC) + (px_ * 3)
+	return lpeek(vram_, index_) & 0xFFFFFF
+	#global
+	
+	#module
+	#uselib "user32.dll"
+	#func	DrawText	"DrawTextA"		int, sptr, int, int, int
+	#define DT_TOP			 			0x00000000
+	#define DT_LEFT						0x00000000
+	#define DT_CENTER					0x00000001
+	#define DT_RIGHT					0x00000002
+	#define DT_VCENTER					0x00000004
+	#define DT_BOTTOM					0x00000008
+	#define DT_WORDBREAK				0x00000010
+	#define DT_SINGLELINE				0x00000020
+	#define DT_EXPANDTABS				0x00000040
+	#define DT_TABSTOP					0x00000080
+	#define DT_NOCLIP					0x00000100
+	#define DT_EXTERNALLEADING			0x00000200
+	#define DT_CALCRECT					0x00000400
+	#define DT_NOPREFIX					0x00000800
+	#define DT_INTERNAL					0x00001000
+	#define DT_EDITCONTROL				0x00002000
+	#define DT_PATH_ELLIPSIS			0x00004000
+	#define DT_END_ELLIPSIS				0x00008000
+	#define DT_MODIFYSTRING				0x00010000
+	#define DT_RTLREADING				0x00020000
+	#define DT_WORD_ELLIPSIS			0x00040000
+	#define DT_NOFULLWIDTHCHARBREAK		0x00080000
+	#defcfunc printHeightSize str mes_, int width_, int height_, int tabsize_
+		rc_ = ginfo_cx, ginfo_cy, ginfo_cx+width_, ginfo_cy+height_
+		DrawText hdc, mes_, strlen(mes_), varptr(rc_), DT_EDITCONTROL | DT_WORDBREAK | DT_NOFULLWIDTHCHARBREAK | DT_LEFT | DT_TOP | DT_EXPANDTABS | DT_CALCRECT
+	return stat
+	#deffunc print__ str mes_, int width_, int height_, int tabsize_
+		void printHeightSize(mes_, width_, height_, tabsize_)
+		DrawText hdc, mes_, strlen(mes_), varptr(rc_), DT_EDITCONTROL | DT_WORDBREAK | DT_NOFULLWIDTHCHARBREAK | DT_LEFT | DT_TOP | DT_EXPANDTABS
+		pos ginfo_cx, ginfo_cy+stat
+	return stat
+	#global	
+
